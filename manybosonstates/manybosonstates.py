@@ -581,8 +581,8 @@ class ManyBosonStatesSuperposition(ManyBosonState):
         """Retrieve scalar coefficients of components."""
         return np.array([s.coefficient for s in self.data])
 
-    def _evolve_list_of_Focks(self, matrix):
-        """Evolution occurs INPLACE atm."""
+    def _evolve_list_of_Focks(self, matrix, inplace):
+        """Evolution occurs not inplace by default."""
         self.repr = 'list of Products'
         newdata = []
         for fock_state in self.data:
@@ -594,19 +594,27 @@ class ManyBosonStatesSuperposition(ManyBosonState):
             logging.debug('Renormalizing state.')
             for prod_state in newdata:
                 prod_state.many_boson_amplitudes.coefficient /= norm
-        self.data = newdata
+        if inplace:
+            self.data = newdata
+        else:
+            newself = copy.deepcopy(self)
+            newself.data = newdata
+            return newself
 
-    def evolve(self, matrix):
+    def evolve(self, matrix, inplace=False):
+        """Evolve the superposition of many-boson states."""
         # consistency checks
-        # from IPython.core.debugger import set_trace; set_trace()
         if matrix.shape[0] != self.n_modes:
             raise ValueError('Modes mismatch: {} != {}'.format(
                 matrix.shape[0], self.n_modes
             ))
         # how the system is evolved depends on the internal representation
         if self.repr == 'list of Focks':
-            self._evolve_list_of_Focks(matrix)
-            return None
+            out = self._evolve_list_of_Focks(matrix, inplace=inplace)
+            if inplace:
+                return None
+            else:
+                return out
     
     def get_many_boson_amplitudes(self, **kwargs):
         if self.repr == 'list of Products':
