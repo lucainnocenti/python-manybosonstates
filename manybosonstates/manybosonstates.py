@@ -1,8 +1,13 @@
 """Define the ManyBosonFockState class."""
+import copy
 import itertools
+import numbers
 import warnings
+import logging
+from abc import ABC, abstractmethod
 
 import numpy as np
+import pandas as pd
 import scipy.sparse
 
 from .linalg_utilities import DimensionalityError, binom, fact, safe_dot
@@ -29,16 +34,192 @@ def _num_states_partition_class(n_modes, partition_class):
     return fact(n_modes) // mu_factor
 
 
-class ManyBosonFockState:
+class _ManyBosonAmplitudes:
+    def __init__(self, n_modes=None, n_bosons=None,
+                 list_of_single_boson_amps=None, many_boson_amps=None):
+        """
+        If provided with `list_of_single_boson_amps`, store each single-boson
+        amplitude separately. Do not compute the many-boson amplitudes unless
+        explicitly asked to.
+
+        Parameters
+        ----------
+        n_modes : int, optional
+        n_bosons : int, optional
+        list_of_single_boson_amps : 2D array
+            If given, specifies many-boson amplitudes for product states,
+            through the lists of single-boson amplitudes.
+        many_boson_amps : array or dict
+            Full list of many-boson amplitudes.
+        """
+        logging.debug('Instantiating _ManyBosonAmplitudes object')
+        # preflight checks
+        if (list_of_single_boson_amps is not None
+                and many_boson_amps is not None):
+            warnings.warn('Both `list_of_single_boson_amps` and `many_boson_'
+                          'amps` have been given. The latter is going to over'
+                          'ride the former.')
+        # initialize class attributes
+        self.n_bosons = 0
+        self.n_modes = None
+        self._list_of_amps = None
+        self._many_boson_amps_dict = None
+        self._many_boson_amps_joined = None
+        self._sorting_method = 'cf_first'
+        self.is_product_state = None
+        self.coefficient = 1.
+        # decide how to proceed based on the kind of input arguments
+        if many_boson_amps is not None:
+            if isinstance(many_boson_amps, dict):
+                bunching_groups = many_boson_amps.keys()
+                full_bunched_group = min(bunching_groups, key=len)
+                self.n_bosons = full_bunched_group[0]
+                self.n_modes = len(many_boson_amps[full_bunched_group])
+                self._many_boson_amps_dict = many_boson_amps
+            else:
+                if n_modes is None or n_bosons is None:
+                    raise ValueError('Cannot retrieve number of bosons or '
+                                     'number of modes from a joined string of'
+                                     ' amplitudes.')
+                self.n_bosons = n_bosons
+                self.n_modes = n_modes
+                self._many_boson_amps_joined = many_boson_amps
+        elif list_of_single_boson_amps is not None:
+            list_1bamps = np.asarray(list_of_single_boson_amps)
+            _n_modes = list_1bamps.shape[1]
+            _n_bosons = list_1bamps.shape[0]
+            # check consistency with other arguments
+            if n_modes is not None and n_modes != _n_modes:
+                    raise ValueError('Inconsistent number of modes.')
+            if n_bosons is not None and n_bosons != _n_bosons:
+                raise ValueError('Inconsistent number of bosons.')
+            # everything seems to be alright, proeed
+            self.n_modes = _n_modes
+            self.n_bosons = _n_bosons
+            self._list_of_amps = list_1bamps
+            logging.debug('Added amplitudes: {}'.format(self._list_of_amps))
+
+    def __add__(self, other):
+        """Implement coherent addition of different sets of many-boson amps.
+        """
+        self_amps = self._retrieve_mbamps_dict()
+        other_amps = other._retrieve_mbamps_dict()
+        final_amps = {}
+        for key in self_amps.keys():
+            final_amps[key] = (self.coefficient * self_amps[key] +
+                               other.coefficient * other_amps[key])
+        return _ManyBosonAmplitudes(
+            n_modes=self.n_modes, n_bosons=self.n_bosons,
+            many_boson_amps=final_amps
+        )
+
+    def __mul__(self, other):
+        """Implement multiplication with scalar."""
+        if not isinstance(other, numbers.Number):
+            raise ValueError('Only multiplication with numbers is supported.')
+        self.coefficient *= other
+
+    def _compute_mbamps_dict(self):
+        # We shouldn't need to consider the scalar coefficient at this point,
+        # or risk to mess the normalization.
+        if self._list_of_amps is None:
+            return
+        self._many_boson_amps_dict = symmetrise_arrays(*self._list_of_amps)
+        # if self.coefficient != 1:
+        #     for key in self._many_boson_amps_dict.keys():
+        #         self._many_boson_amps_dict[key] *= self.coefficient
+
+    def _retrieve_mbamps_dict(self, update=True):
+        if update or self._many_boson_amps_dict is None:
+            self._compute_mbamps_dict()
+        return self._many_boson_amps_dict
+
+    def _compute_mbamps_joined(self):
+        # the big vector of many-boson amplitudes is computed from the
+        # dictionary-based one. Note that this will also recompute the amps
+        # in dictionary form
+        self._compute_mbamps_dict()
+        mbamps_dict = self._retrieve_mbamps_dict()
+        # convert dict to joined
+        if self._sorting_method == 'cf_first':
+            self._many_boson_amps_joined = np.concatenate(
+                tuple(amps for _, amps in mbamps_dict.items())
+            )
+        else:
+            raise ValueError('TBD')
+
+    def _retrieve_mbamps_joined(self, update=True):
+        if update or self._many_boson_amps_joined is None:
+            self._compute_mbamps_joined()
+        return self._many_boson_amps_joined
+
+    def add_amplitude(self, new_amplitude):
+        logging.debug('Adding amplitude to _ManyBosonAmplitudes')
+        self.n_bosons += 1
+        new_amplitude = np.asarray(new_amplitude)[None, :]
+        if self._list_of_amps is None:
+            logging.debug('')
+            self._list_of_amps = new_amplitude
+        else:
+            self._list_of_amps = np.concatenate(
+                (self._list_of_amps, new_amplitude),
+                axis=0
+            )
+
+    def get_many_boson_amplitudes(self, which='all', joined=False,
+                                  update=True):
+        if isinstance(which, str) and which == 'all':
+            if joined:
+                return self._retrieve_mbamps_joined(update=update)
+            else:
+                return self._retrieve_mbamps_dict(update=update)
+
+class ManyBosonState(ABC):
+    """Abstract class for many boson states."""
+    def __mul__(self, coefficient):
+        """Multiply with a scalar.
+
+        Note that this will copy the object with all of its content, modify the
+        copy, and return it. The original state will NOT be changed inplace.
+        """
+        if isinstance(coefficient, ManyBosonState):
+            raise ValueError('To be done')
+        else:
+            new_state = copy.deepcopy(self)
+            new_state.coefficient *= coefficient
+            return new_state
+    
+    __rmul__ = __mul__
+
+    def __sub__(self, other):
+        return self + (-other)
+
+    def __neg__(self):
+        return self * -1
+    
+    def __pos__(self):
+        return self
+
+    @abstractmethod
+    def get_many_boson_amplitudes(self):
+        pass
+
+    def get_mbas(self, *args, **kwargs):
+        return self.get_many_boson_amplitudes(*args, **kwargs)
+
+
+class ManyBosonFockState(ManyBosonState):
     r"""A single many-boson Fock state (like a_1^\dagger a_2^\dagger)."""
 
     def __init__(self, n_modes=None, mal=None, mol=None):
         """Initialise necessary properties."""
+        logging.debug('Instantiating ManyBosonFockState object')
         # initialize class attributes
         self.mol = None
         self.mal = None
         self.n_modes = None
         self.n_bosons = None
+        self.coefficient = 1. # scalar added to the state
         # only one between `mol` and `mal` must be given
         if mal is not None and mol is not None:
             raise ValueError('Only one between `mol` and `mal` must'
@@ -46,6 +227,12 @@ class ManyBosonFockState:
         # if the state is defined using a mode occupation list, the value of
         # `n_modes` is ignored
         if mol is not None:
+            # check that at least some boson has been specified
+            if all(v == 0 for v in mol):
+                raise ValueError('A MOL with all zeros is not a valid state.')
+            if len(mol) != n_modes:
+                raise ValueError('The length of `mol` must coincide with the '
+                                 'number of modes in the state.')
             self.mol = mol
             self.n_modes = len(mol)
             self.n_bosons = sum(mol)
@@ -64,6 +251,29 @@ class ManyBosonFockState:
                 self.n_modes = max(mal)
             self.mal = tuple(sorted(mal))
             self.n_bosons = len(mal)
+
+    def __add__(self, other):
+        logging.debug('Trying to add {} to {}'.format(self, other))
+        if isinstance(other, ManyBosonFockState):
+            return ManyBosonStatesSuperposition._from_sum_of_Focks(self, other)
+        else:
+            raise ValueError('Not implemented yet.')
+
+    def _get_mol_string(self):
+        mol = self.get_mol()
+        string = '|'
+        for n in mol:
+            string += str(n) + ','
+        string = string[:-1] + ' >'
+        return string
+
+    def __repr__(self):
+        string = 'Fock state with {} modes:\n  '.format(self.n_modes)
+        if self.coefficient != 1:
+            string += str(self.coefficient) + ' * '
+        string += self._get_mol_string()
+        return string
+
 
     def get_mol(self):
         """Get mode occupation list representing the state."""
@@ -150,6 +360,9 @@ class ManyBosonFockState:
 
             return counter
 
+    def get_many_boson_amplitudes(self):
+        return self.get_mol()
+
     def evolve(self, matrix):
         """Evolve the state with the given evolution matrix.
 
@@ -157,6 +370,7 @@ class ManyBosonFockState:
         class. This function thus converts the `ManyBosonFockState` into a
         `ManyBosonProductState` and calls the `evolve` method from there.
         """
+        logging.debug('Evolving ManyBosonFock state')
         if matrix.shape[0] != self.n_modes:
             raise DimensionalityError('Modes mismatch, {} != {}.'.format(
                 matrix.shape[0], self.n_modes))
@@ -164,16 +378,23 @@ class ManyBosonFockState:
         mal = self.get_mal()
         # take every boson specified in `mal` and inject it separately
         # as a new excitation for a `ManyBosonProductState` object
-        mbs = ManyBosonProductState(self.n_modes)
+        mbps = ManyBosonProductState(self.n_modes)
+        mbps._coefficient = self.coefficient
+        # TODO: we could be more efficient here by computing only once the
+        #       output amplitudes per input populated mode (that is, evoid to
+        #       recompute output amplitudes for modes with more than one boson)
+        logging.debug('Loading states into newly created ManyBosonProductState')
         for boson_idx in mal:
             amplitudes = _mal_to_mol((boson_idx,), n_modes=self.n_modes)
-            mbs.add_excitation(amplitudes)
+            logging.debug('Loading amplitude no {}'.format(boson_idx))
+            mbps.add_excitation(amplitudes)
         # actually evolve the state using `matrix`
-        mbs.evolve(matrix)
-        return mbs
+        logging.debug('Evolving ManyBosonProductState with given matrix')
+        mbps.evolve(matrix, inplace=True)
+        return mbps
 
 
-class ManyBosonProductState:
+class ManyBosonProductState(ManyBosonState):
     """Many boson product state object.
 
     This object is used to represent many-boson states that can be written as
@@ -185,13 +406,45 @@ class ManyBosonProductState:
 
     def __init__(self, n_modes):
         """Initialize class variables."""
+        logging.debug('Instantiating ManyBosonProductState object')
         self.n_modes = n_modes
         self.n_bosons = 0
-        self.amplitudes = []  # list of amplitude vectors, 1 element per boson
-        self.many_body_amplitudes = None
+        self.amplitudes = None  # list of amplitude vectors, 1 element per boson
+        self._coefficient = 1
+        self.many_boson_amplitudes = None
+
+    def __repr__(self):
+        string = ("Product state. Number of modes: {}. Number of photons: {}."
+                  "\n".format(self.n_modes, len(self.amplitudes)))
+        if self.many_boson_amplitudes.coefficient != 1:
+            string += 'Coefficient: '
+            string += str(self.many_boson_amplitudes.coefficient)
+        string += '\nAmplitudes:\n' + str(self.amplitudes)
+        return string
+    
+    def _repr_html_(self):
+        string = '<div><p>'
+        string += ("Product state. Number of modes: {}. Number of photons: {}."
+                   .format(self.n_modes, len(self.amplitudes)))
+        if self.many_boson_amplitudes.coefficient != 1:
+            string += '<br><b>Coefficient:</b> {}'.format(
+                self.many_boson_amplitudes.coefficient)
+        string += '<br><b>Amplitudes:</b></p></div>' 
+        pd.options.display.float_format = '{:,.2f}'.format
+        df = pd.DataFrame(self.amplitudes)
+        df.index = ['State ' + str(idx) for idx in range(df.shape[0])]
+        return string + df._repr_html_()
+
+    @property
+    def coefficient(self):
+        return self.many_boson_amplitudes.coefficient
+
+    @coefficient.setter
+    def coefficient(self, value):
+        self.many_boson_amplitudes.coefficient = value
 
     def add_excitation(self, new_amplitude):
-        """Add an excitation to the many boson state.
+        """Add an excitation to the many boson state. Acts inplace.
 
         The new amplitude is renormalized and then stored into
         `self.amplitudes`, and the `self.n_bosons` counter is updated.
@@ -199,6 +452,7 @@ class ManyBosonProductState:
         bunching are applied later when the many boson amplitudes are
         requested).
         """
+        logging.debug('Adding excitation to ManyBosonProductState')
         # check consistency of number of modes of added amplitude
         if new_amplitude.shape[0] != self.n_modes:
             raise ValueError('Incorrect number of modes: {} != {}.'.format(
@@ -208,38 +462,35 @@ class ManyBosonProductState:
         # normalize new amplitude
         new_amplitude = np.asarray(new_amplitude, dtype=np.complex)
         new_amplitude /= np.linalg.norm(new_amplitude)
-        self.amplitudes.append(new_amplitude)
+        # update many-boson amplitudes state
+        if self.many_boson_amplitudes is None:
+            self.many_boson_amplitudes = _ManyBosonAmplitudes(
+                list_of_single_boson_amps=new_amplitude[None, :])
+            self.amplitudes = self.many_boson_amplitudes._list_of_amps
+            self.many_boson_amplitudes.coefficient = self._coefficient
+            del self._coefficient
+        else:
+            self.many_boson_amplitudes.add_amplitude(new_amplitude)
+            self.amplitudes = self.many_boson_amplitudes._list_of_amps
+        logging.debug('New amplitudes: {}'.format(self.amplitudes))
         # the following only makes sense for 2 bosons (not sure for more):
         # store normalization factor if the newly added amplitude is not
         # orthogonal
         # self.norm = np.abs(np.vdot(*self.amplitudes)) ^ 2
         # self.norm = np.sqrt(1 + self.norm)
-        return self
+        return None
 
     def remove_excitation(self, index_excitation):
-        """Remove a specific interaction."""
+        """Remove a specific interaction. Acts inplace."""
         if self.n_bosons == 0:
             raise ValueError('There are no excitations left to remove.')
 
         del self.amplitudes[index_excitation]
         self.n_bosons -= 1
-        return self
+        return None
 
-    def compute_many_boson_amplitudes(self):
-        """Compute the corresponding symmetrised many boson state.
-
-        This function *does not* return the computed amplitudes, it
-        only stores them in `self.many_body_amplitudes`, and returns
-        the same instance of the class.
-        Use `get_many_boson_amplitudes` to compute *and* return the
-        amplitudes.
-        """
-        amps = symmetrise_arrays(*self.amplitudes)
-        self.many_body_amplitudes = amps
-
-        return self
-
-    def get_many_boson_amplitudes(self, joined=False):
+    def get_many_boson_amplitudes(self, which='all', joined=False,
+                                  update=True):
         """Compute and return many boson amplitudes.
 
         Parameters
@@ -249,16 +500,123 @@ class ManyBosonProductState:
             1d numpy array. Otherwise, the output is a dictionary with
             keys the various bunching classes and values the amplitudes
             corresponding to that bunching class.
+        update : bool
+            If True, the many-boson amplitudes are recomputed.
         """
-        mbs_dict = self.compute_many_boson_amplitudes().many_body_amplitudes
-        if joined:
-            return np.concatenate(tuple(amps for _, amps in mbs_dict.items()))
+        if self.many_boson_amplitudes is None:
+            raise ValueError('Amplitudes not computed, for some reason.')
+        return self.many_boson_amplitudes.get_many_boson_amplitudes(
+            which=which, joined=joined, update=update)
+
+    def evolve(self, matrix, inplace=False):
+        """Evolve the many-boson state using the given evolution matrix."""
+        if inplace:
+            self_ = self
         else:
-            return mbs_dict
+            self_ = copy.deepcopy(self)
+        # do the stuff
+        for boson_index in range(self_.n_bosons):
+            self_.amplitudes[boson_index] = matrix.dot(
+                self_.amplitudes[boson_index])
+        # return result
+        if inplace:
+            return None
+        else:
+            return self_
+
+
+class ManyBosonStatesSuperposition(ManyBosonState):
+    """Represent sum of product of many-boson states."""
+    def __init__(self, data, repr=None):
+        if repr is None:
+            raise ValueError('Not implemented yet.')
+
+        self.repr = repr
+        self.data = data
+
+        self.n_modes = None
+        self.many_boson_amplitudes = None
+
+        if self.repr == 'list of Focks':
+            self.n_modes = self.data[0].n_modes
+        
+    @classmethod
+    def _from_sum_of_Focks(cls, first_state, second_state):
+        # check dimensions and stuff
+        if first_state.n_modes != second_state.n_modes:
+            raise ValueError('The number of modes must be the same.')
+        # if all is right, instantiate
+        return cls(
+            repr='list of Focks',
+            data=[first_state, second_state]
+        )
+    
+    def __repr__(self):
+        if self.repr == 'list of Focks':
+            string = 'Superposition of Fock states.\n  '
+            for fock_state in self.data:
+                if fock_state.coefficient != 1:
+                    string += str(fock_state.coefficient) + ' * '
+                string += fock_state._get_mol_string()
+                string += ' + '
+            return string[:-2]
+        elif self.repr == 'list of Products':
+            string = 'Superposition of product states.'
+            for idx, state in enumerate(self.data):
+                string += '\n----------------\n'
+                string += '## State {}:\n'.format(idx)
+                string += '{}'.format(state.__repr__())
+            string += '\n----------------\n'
+            return string
+
+    def normalize_coefficients(self):
+        """Normalize coefficients inplace."""
+        coefficients = np.array([s.coefficient for s in self.data])
+        norm = scipy.linalg.norm(coefficients)
+        for state in self.data:
+            state.coefficient /= norm
+        return None
+
+    def get_coefficients(self):
+        """Retrieve scalar coefficients of components."""
+        return np.array([s.coefficient for s in self.data])
+
+    def _evolve_list_of_Focks(self, matrix):
+        """Evolution occurs INPLACE atm."""
+        self.repr = 'list of Products'
+        newdata = []
+        for fock_state in self.data:
+            newdata.append(fock_state.evolve(matrix))
+        # renormalize coefficients if needed
+        coefficients = np.array([s.coefficient for s in newdata])
+        norm = scipy.linalg.norm(coefficients)
+        if not np.allclose(norm, 1):
+            logging.debug('Renormalizing state.')
+            for prod_state in newdata:
+                prod_state.many_boson_amplitudes.coefficient /= norm
+        self.data = newdata
 
     def evolve(self, matrix):
-        """Evolve the many-boson state using the given evolution matrix."""
-        for boson_index in range(self.n_bosons):
-            self.amplitudes[boson_index] = matrix.dot(
-                self.amplitudes[boson_index])
-        return self
+        # consistency checks
+        # from IPython.core.debugger import set_trace; set_trace()
+        if matrix.shape[0] != self.n_modes:
+            raise ValueError('Modes mismatch: {} != {}'.format(
+                matrix.shape[0], self.n_modes
+            ))
+        # how the system is evolved depends on the internal representation
+        if self.repr == 'list of Focks':
+            self._evolve_list_of_Focks(matrix)
+            return None
+    
+    def get_many_boson_amplitudes(self, **kwargs):
+        if self.repr == 'list of Products':
+            final_amps = None  # many-boson amplitudes to be returned
+            for state in self.data:  # state.__class__ is _ManyBosonAmplitude
+                if final_amps is None:
+                    final_amps = state.many_boson_amplitudes
+                    continue
+                final_amps = final_amps + state.many_boson_amplitudes
+            self.many_boson_amplitudes = final_amps
+        else:
+            raise ValueError('TBD')
+        return self.many_boson_amplitudes.get_many_boson_amplitudes(**kwargs)
