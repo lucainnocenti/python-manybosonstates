@@ -15,4 +15,4 @@ import manybosonstates.manybosonstates as mb
 mb.ManyBosonFockState(4, (0, 1)).get_mol()
 ```
 If the output is `[1, 1, 0, 0]`, then you are good to go.
-See [manybosonstates_examples.ipynb](../notebooks/manybosonstates_examples.ipynb) for usage examples.
+See [manybosonstates_examples.ipynb](./notebooks/manybosonstates_examples.ipynb) for usage examples.
